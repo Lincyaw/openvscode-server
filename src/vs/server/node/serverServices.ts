@@ -96,6 +96,7 @@ import { McpManagementChannel } from '../../platform/mcp/common/mcpManagementIpc
 import { AllowedMcpServersService } from '../../platform/mcp/common/allowedMcpServersService.js';
 import { IMcpGalleryManifestService } from '../../platform/mcp/common/mcpGalleryManifest.js';
 import { McpGalleryManifestIPCService } from '../../platform/mcp/common/mcpGalleryManifestServiceIpc.js';
+import { MobileGitChannel, MobileEditorChannel, MobileBridgeMetadataWriter } from './mobileRuntimeBridgeChannel.js';
 
 const eventPrefix = 'monacoworkbench';
 
@@ -262,6 +263,12 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 		socketServer.registerChannel('extensions', channel);
 
 		socketServer.registerChannel('mcpManagement', new McpManagementChannel(mcpManagementService, (ctx: RemoteAgentConnectionContext) => getUriTransformer(ctx.remoteAuthority)));
+
+		// Mobile Runtime Bridge
+		const bridgeMetadataWriter = new MobileBridgeMetadataWriter();
+		bridgeMetadataWriter.write();
+		socketServer.registerChannel('openvsmobile/git', new MobileGitChannel(logService));
+		socketServer.registerChannel('openvsmobile/editor', new MobileEditorChannel(logService));
 
 		// clean up extensions folder
 		remoteExtensionsScanner.whenExtensionsReady().then(() => extensionManagementService.cleanUp());
