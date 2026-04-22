@@ -35,6 +35,7 @@ import { ServiceCollection } from '../../platform/instantiation/common/serviceCo
 import { ILanguagePackService } from '../../platform/languagePacks/common/languagePacks.js';
 import { NativeLanguagePackService } from '../../platform/languagePacks/node/languagePacks.js';
 import { AbstractLogger, DEFAULT_LOG_LEVEL, getLogLevel, ILoggerService, ILogService, log, LogLevel, LogLevelToString } from '../../platform/log/common/log.js';
+import { IMarkerService } from '../../platform/markers/common/markers.js';
 import product from '../../platform/product/common/product.js';
 import { IProductService } from '../../platform/product/common/productService.js';
 import { RemoteAgentConnectionContext } from '../../platform/remote/common/remoteAgentEnvironment.js';
@@ -60,6 +61,9 @@ import { ServerConnectionToken } from './serverConnectionToken.js';
 import { ServerEnvironmentService, ServerParsedArgs } from './serverEnvironmentService.js';
 import { REMOTE_TERMINAL_CHANNEL_NAME } from '../../workbench/contrib/terminal/common/remote/remoteTerminalChannel.js';
 import { REMOTE_FILE_SYSTEM_CHANNEL_NAME } from '../../workbench/services/remote/common/remoteFileSystemProviderClient.js';
+import { ITextFileService } from '../../workbench/services/textfile/common/textfiles.js';
+import { IEditorWorkerService } from '../../editor/common/services/editorWorker.js';
+import { ILanguageFeaturesService } from '../../editor/common/services/languageFeatures.js';
 import { ExtensionHostStatusService, IExtensionHostStatusService } from './extensionHostStatusService.js';
 import { IExtensionsScannerService } from '../../platform/extensionManagement/common/extensionsScannerService.js';
 import { ExtensionsScannerService } from './extensionsScannerService.js';
@@ -268,7 +272,13 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 		const bridgeMetadataWriter = new MobileBridgeMetadataWriter();
 		bridgeMetadataWriter.write();
 		socketServer.registerChannel('openvsmobile/git', new MobileGitChannel(logService));
-		socketServer.registerChannel('openvsmobile/editor', new MobileEditorChannel(logService));
+		socketServer.registerChannel('openvsmobile/editor', new MobileEditorChannel(
+			logService,
+			accessor.get(ITextFileService),
+			accessor.get(ILanguageFeaturesService),
+			accessor.get(IEditorWorkerService),
+			accessor.get(IMarkerService),
+		));
 
 		// clean up extensions folder
 		remoteExtensionsScanner.whenExtensionsReady().then(() => extensionManagementService.cleanUp());
