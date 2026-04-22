@@ -6,7 +6,7 @@
 import * as http from 'http';
 import { promises as fs, mkdirSync } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { basename, join } from 'path';
 import { CancellationToken } from '../../base/common/cancellation.js';
 import { Event, Emitter } from '../../base/common/event.js';
 import { IMarkdownString } from '../../base/common/htmlContent.js';
@@ -27,11 +27,18 @@ import { createTextBufferFactory } from '../../editor/common/model/textModel.js'
 import { IEditorWorkerService } from '../../editor/common/services/editorWorker.js';
 import { ILanguageFeaturesService } from '../../editor/common/services/languageFeatures.js';
 import { IServerChannel } from '../../base/parts/ipc/common/ipc.js';
+import { IConfigurationService } from '../../platform/configuration/common/configuration.js';
 import { ILogService } from '../../platform/log/common/log.js';
 import { IMarker, IMarkerService, MarkerSeverity } from '../../platform/markers/common/markers.js';
+import { IProductService } from '../../platform/product/common/productService.js';
 import { Progress } from '../../platform/progress/common/progress.js';
 import { RemoteAgentConnectionContext } from '../../platform/remote/common/remoteAgentEnvironment.js';
+import { IProcessDataEvent, IPtyHostService, ITerminalLaunchError, ITerminalProcessOptions, ProcessPropertyType, TitleEventSource } from '../../platform/terminal/common/terminal.js';
+import { IWorkspaceContextService, IWorkspaceFoldersChangeEvent, WorkbenchState } from '../../platform/workspace/common/workspace.js';
+import { getWorkspaceSymbols, IWorkspaceSymbol } from '../../workbench/contrib/search/common/search.js';
+import { DEFAULT_MAX_SEARCH_RESULTS, ISearchComplete, ISearchService, isFileMatch, QueryType, resultIsMatch } from '../../workbench/services/search/common/search.js';
 import { IResolvedTextFileEditorModel, ITextFileEditorModel, ITextFileService } from '../../workbench/services/textfile/common/textfiles.js';
+import { createTerminalEnvironment } from '../../workbench/contrib/terminal/common/terminalEnvironment.js';
 
 // ---------------------------------------------------------------------------
 // Bridge metadata writer
@@ -92,19 +99,18 @@ export class MobileBridgeMetadataWriter {
 					aheadBehind: true,
 				},
 				terminal: {
-					enabled: false,
+					enabled: true,
 					persistentSessions: false,
-					split: false,
+					split: true,
 					commandDetection: false,
-					reason: 'Terminal runtime bridge is not implemented yet.',
 				},
 				workspace: {
-					enabled: false,
-					search: false,
-					symbols: false,
-					folders: false,
-					problems: false,
-					reason: 'Workspace intelligence bridge is not implemented yet.',
+					enabled: true,
+					search: true,
+					symbols: true,
+					folders: true,
+					problems: true,
+					eventStream: true,
 				},
 			},
 			bridgeVersion: '0.1.0',
@@ -183,7 +189,7 @@ function asError(error: unknown): Error {
 }
 
 class GitRuntimeBridgeClient {
-	constructor(private readonly _logService: ILogService) { }
+	constructor() { }
 
 	private async readInfo(retries = 20): Promise<GitRuntimeBridgeInfo> {
 		let lastError: Error | undefined;
@@ -252,7 +258,7 @@ class GitRuntimeBridgeClient {
 	watchRepository(path: string, onEvent: (repository: GitRepositoryDocument) => void, onError: (error: Error) => void): () => void {
 		let disposed = false;
 		let request: http.ClientRequest | undefined;
-		let reconnectHandle: NodeJS.Timeout | undefined;
+		let reconnectHandle: ReturnType<typeof setTimeout> | undefined;
 
 		const scheduleReconnect = () => {
 			if (disposed || reconnectHandle) {
@@ -334,7 +340,7 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 	private readonly runtimeClient: GitRuntimeBridgeClient;
 
 	constructor(private readonly _logService: ILogService) {
-		this.runtimeClient = new GitRuntimeBridgeClient(_logService);
+		this.runtimeClient = new GitRuntimeBridgeClient();
 	}
 
 	call(_ctx: RemoteAgentConnectionContext, command: string, arg?: any): Promise<any> {
@@ -475,6 +481,734 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 			}
 			return disposable;
 		};
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Terminal channel
+// ---------------------------------------------------------------------------
+
+interface TerminalSessionDocument {
+	id: string;
+	name: string;
+	cwd: string;
+	profile: string;
+	state: 'running' | 'exited';
+	exitCode?: number;
+	rows: number;
+	cols: number;
+	shellIntegration?: Record<string, unknown>;
+}
+
+interface TerminalAttachDocument {
+	session: TerminalSessionDocument;
+	backlog?: string;
+}
+
+interface TerminalLifecycleEnvelope {
+	type: 'created' | 'updated' | 'closed';
+	session: TerminalSessionDocument;
+}
+
+interface TerminalStreamEnvelope {
+	type: 'output' | 'exit' | 'closed';
+	data?: string;
+	session?: TerminalSessionDocument;
+}
+
+interface TerminalSessionRecord {
+	processId: number;
+	document: TerminalSessionDocument;
+	backlog: Buffer;
+	stream: Emitter<TerminalStreamEnvelope>;
+}
+
+const maxTerminalBacklogBytes = 64 * 1024;
+
+export class MobileTerminalChannel implements IServerChannel<RemoteAgentConnectionContext> {
+	private readonly sessionChanged = new Emitter<TerminalLifecycleEnvelope>();
+	private readonly sessions = new Map<string, TerminalSessionRecord>();
+	private readonly sessionIdsByProcessId = new Map<number, string>();
+
+	constructor(
+		private readonly _logService: ILogService,
+		private readonly _ptyHostService: IPtyHostService,
+		private readonly _configurationService: IConfigurationService,
+		private readonly _productService: IProductService,
+	) {
+		this._ptyHostService.onProcessData(event => this.onProcessData(event.id, event.event));
+		this._ptyHostService.onProcessExit(event => this.onProcessExit(event.id, event.event));
+		this._ptyHostService.onDidChangeProperty(event => this.onDidChangeProperty(event.id, event.property.type, event.property.value));
+	}
+
+	call(_ctx: RemoteAgentConnectionContext, command: string, arg?: any): Promise<any> {
+		this._logService.trace(`[MobileTerminalChannel] ${command}`, arg);
+		switch (command) {
+			case 'list': return Promise.resolve(this.list());
+			case 'create': return this.create(arg);
+			case 'attach': return Promise.resolve(this.attach(arg));
+			case 'input': return this.input(arg);
+			case 'resize': return this.resize(arg);
+			case 'rename': return this.rename(arg);
+			case 'split': return this.split(arg);
+			case 'close': return this.close(arg);
+		}
+		throw new Error(`Command not found: ${command}`);
+	}
+
+	listen(_ctx: RemoteAgentConnectionContext, event: string, arg?: any): Event<any> {
+		switch (event) {
+			case 'sessionChanged':
+				return this.sessionChanged.event;
+			case 'stream':
+				return this.subscribeStream(arg?.id as string | undefined);
+		}
+		throw new Error(`Event not found: ${event}`);
+	}
+
+	private list(): TerminalSessionDocument[] {
+		return Array.from(this.sessions.values(), session => this.serialize(session.document));
+	}
+
+	private async create(arg: any): Promise<TerminalSessionDocument> {
+		const cwd = typeof arg?.cwd === 'string' && arg.cwd ? arg.cwd : process.env.HOME || '/';
+		const profile = normalizeTerminalProfile(arg?.profile as string | undefined);
+		const rows = normalizeTerminalDimension(arg?.rows, 24);
+		const cols = normalizeTerminalDimension(arg?.cols, 80);
+		const name = typeof arg?.name === 'string' && arg.name.trim().length > 0
+			? arg.name.trim()
+			: basename(profileToShellPath(profile));
+
+		const baseEnv = sanitizeProcessEnv(process.env);
+		const shellLaunchConfig = {
+			name,
+			executable: profileToShellPath(profile),
+			cwd,
+			type: 'Local' as const,
+			isFeatureTerminal: true,
+		};
+		const env = await createTerminalEnvironment(
+			shellLaunchConfig,
+			this.getTerminalEnvFromConfig(),
+			undefined,
+			this._productService.version,
+			this.getDetectLocale(),
+			baseEnv,
+		);
+		const options: ITerminalProcessOptions = {
+			shellIntegration: {
+				enabled: false,
+				suggestEnabled: false,
+				nonce: '',
+			},
+			windowsUseConptyDll: false,
+			environmentVariableCollections: undefined,
+			workspaceFolder: undefined,
+			isScreenReaderOptimized: false,
+		};
+		const processId = await this._ptyHostService.createProcess(
+			shellLaunchConfig,
+			cwd,
+			cols,
+			rows,
+			'11',
+			env,
+			baseEnv,
+			options,
+			false,
+			'openvsmobile',
+			'OpenVS Mobile',
+		);
+
+		const document: TerminalSessionDocument = {
+			id: formatTerminalSessionId(processId),
+			name,
+			cwd,
+			profile,
+			state: 'running',
+			rows,
+			cols,
+		};
+		const session: TerminalSessionRecord = {
+			processId,
+			document,
+			backlog: Buffer.alloc(0),
+			stream: new Emitter<TerminalStreamEnvelope>(),
+		};
+		this.sessions.set(document.id, session);
+		this.sessionIdsByProcessId.set(processId, document.id);
+
+		const startResult = await this._ptyHostService.start(processId);
+		if (isTerminalLaunchError(startResult)) {
+			this.sessions.delete(document.id);
+			this.sessionIdsByProcessId.delete(processId);
+			session.stream.dispose();
+			throw new Error(startResult.message);
+		}
+
+		this.sessionChanged.fire({ type: 'created', session: this.serialize(document) });
+		return this.serialize(document);
+	}
+
+	private attach(arg: any): TerminalAttachDocument {
+		const session = this.getSession(arg?.id as string | undefined);
+		return {
+			session: this.serialize(session.document),
+			...(session.backlog.length > 0 ? { backlog: session.backlog.toString('base64') } : {}),
+		};
+	}
+
+	private async input(arg: any): Promise<TerminalSessionDocument> {
+		const session = this.getSession(arg?.id as string | undefined);
+		if (session.document.state !== 'running') {
+			throw new Error(`terminal ${session.document.id} is not running`);
+		}
+		const data = typeof arg?.data === 'string' ? arg.data : '';
+		if (!data) {
+			throw new Error('data is required');
+		}
+		await this._ptyHostService.input(session.processId, data);
+		return this.serialize(session.document);
+	}
+
+	private async resize(arg: any): Promise<TerminalSessionDocument> {
+		const session = this.getSession(arg?.id as string | undefined);
+		if (session.document.state !== 'running') {
+			throw new Error(`terminal ${session.document.id} is not running`);
+		}
+		const rows = normalizeTerminalDimension(arg?.rows, session.document.rows);
+		const cols = normalizeTerminalDimension(arg?.cols, session.document.cols);
+		await this._ptyHostService.resize(session.processId, cols, rows);
+		session.document.rows = rows;
+		session.document.cols = cols;
+		this.sessionChanged.fire({ type: 'updated', session: this.serialize(session.document) });
+		return this.serialize(session.document);
+	}
+
+	private async rename(arg: any): Promise<TerminalSessionDocument> {
+		const session = this.getSession(arg?.id as string | undefined);
+		const name = typeof arg?.name === 'string' ? arg.name.trim() : '';
+		if (!name) {
+			throw new Error('name is required');
+		}
+		session.document.name = name;
+		if (session.document.state === 'running') {
+			await this._ptyHostService.updateTitle(session.processId, name, TitleEventSource.Api);
+		}
+		this.sessionChanged.fire({ type: 'updated', session: this.serialize(session.document) });
+		return this.serialize(session.document);
+	}
+
+	private async split(arg: any): Promise<TerminalSessionDocument> {
+		const parent = this.getSession(arg?.parentId as string | undefined);
+		return this.create({
+			name: typeof arg?.name === 'string' && arg.name.trim().length > 0 ? arg.name.trim() : `${parent.document.name} split`,
+			cwd: parent.document.cwd,
+			profile: parent.document.profile,
+			rows: parent.document.rows,
+			cols: parent.document.cols,
+		});
+	}
+
+	private async close(arg: any): Promise<TerminalSessionDocument> {
+		const session = this.getSession(arg?.id as string | undefined);
+		this.sessions.delete(session.document.id);
+		this.sessionIdsByProcessId.delete(session.processId);
+		if (session.document.state === 'running') {
+			session.document.state = 'exited';
+			try {
+				await this._ptyHostService.shutdown(session.processId, false);
+			} catch (error) {
+				this._logService.warn('[MobileTerminalChannel] shutdown failed', error);
+			}
+		}
+		const snapshot = this.serialize(session.document);
+		session.stream.fire({ type: 'closed', session: snapshot });
+		this.sessionChanged.fire({ type: 'closed', session: snapshot });
+		session.stream.dispose();
+		return snapshot;
+	}
+
+	private subscribeStream(id: string | undefined): Event<TerminalStreamEnvelope> {
+		if (!id) {
+			return Event.None;
+		}
+		const session = this.sessions.get(id);
+		if (!session) {
+			return Event.None;
+		}
+		return (listener, thisArgs, disposables) => {
+			const disposable = session.stream.event(listener, thisArgs, disposables);
+			if (session.document.state === 'exited') {
+				queueMicrotask(() => listener.call(thisArgs, { type: 'exit', session: this.serialize(session.document) }));
+			}
+			return disposable;
+		};
+	}
+
+	private onProcessData(processId: number, event: IProcessDataEvent | string): void {
+		const session = this.getSessionByProcessId(processId);
+		if (!session) {
+			return;
+		}
+		const data = typeof event === 'string' ? event : event.data;
+		if (!data) {
+			return;
+		}
+		appendTerminalBacklog(session, data);
+		session.stream.fire({
+			type: 'output',
+			data: Buffer.from(data, 'utf8').toString('base64'),
+		});
+	}
+
+	private onProcessExit(processId: number, event: number | undefined): void {
+		const session = this.getSessionByProcessId(processId);
+		if (!session || session.document.state === 'exited') {
+			return;
+		}
+		session.document.state = 'exited';
+		session.document.exitCode = typeof event === 'number' ? event : undefined;
+		const snapshot = this.serialize(session.document);
+		session.stream.fire({ type: 'exit', session: snapshot });
+		this.sessionChanged.fire({ type: 'updated', session: snapshot });
+	}
+
+	private onDidChangeProperty(processId: number, type: ProcessPropertyType, value: unknown): void {
+		const session = this.getSessionByProcessId(processId);
+		if (!session) {
+			return;
+		}
+		switch (type) {
+			case ProcessPropertyType.Cwd: {
+				if (typeof value === 'string' && value.length > 0 && value !== session.document.cwd) {
+					session.document.cwd = value;
+					this.sessionChanged.fire({ type: 'updated', session: this.serialize(session.document) });
+				}
+				break;
+			}
+			case ProcessPropertyType.UsedShellIntegrationInjection: {
+				session.document.shellIntegration = { enabled: value === true };
+				this.sessionChanged.fire({ type: 'updated', session: this.serialize(session.document) });
+				break;
+			}
+		}
+	}
+
+	private getSession(id: string | undefined): TerminalSessionRecord {
+		if (!id) {
+			throw new Error('id is required');
+		}
+		const session = this.sessions.get(id);
+		if (!session) {
+			throw new Error(`terminal ${id} not found`);
+		}
+		return session;
+	}
+
+	private getSessionByProcessId(processId: number): TerminalSessionRecord | undefined {
+		const sessionId = this.sessionIdsByProcessId.get(processId);
+		return sessionId ? this.sessions.get(sessionId) : undefined;
+	}
+
+	private serialize(document: TerminalSessionDocument): TerminalSessionDocument {
+		return {
+			...document,
+			...(document.exitCode === undefined ? { exitCode: undefined } : {}),
+			...(document.shellIntegration ? { shellIntegration: { ...document.shellIntegration } } : {}),
+		};
+	}
+
+	private getTerminalEnvFromConfig(): Record<string, string | null | undefined> | undefined {
+		if (process.platform === 'win32') {
+			return this._configurationService.getValue('terminal.integrated.env.windows');
+		}
+		if (process.platform === 'darwin') {
+			return this._configurationService.getValue('terminal.integrated.env.osx');
+		}
+		return this._configurationService.getValue('terminal.integrated.env.linux');
+	}
+
+	private getDetectLocale(): 'auto' | 'off' | 'on' {
+		return this._configurationService.getValue<'auto' | 'off' | 'on'>('terminal.integrated.detectLocale') ?? 'auto';
+	}
+}
+
+function formatTerminalSessionId(processId: number): string {
+	return `term-${processId}`;
+}
+
+function normalizeTerminalProfile(profile: string | undefined): string {
+	return profile && profile.trim().length > 0 ? profile.trim() : 'bash';
+}
+
+function normalizeTerminalDimension(value: unknown, fallback: number): number {
+	const parsed = typeof value === 'number' ? value : Number(value);
+	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function profileToShellPath(profile: string): string {
+	switch (profile) {
+		case 'bash':
+		case '/bin/bash':
+		case '/usr/bin/bash':
+			return '/bin/bash';
+		case 'zsh':
+		case '/bin/zsh':
+		case '/usr/bin/zsh':
+			return '/bin/zsh';
+		case 'sh':
+		case '/bin/sh':
+			return '/bin/sh';
+		default:
+			return profile;
+	}
+}
+
+function sanitizeProcessEnv(input: NodeJS.ProcessEnv): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(input)) {
+		if (typeof value === 'string') {
+			env[key] = value;
+		}
+	}
+	return env;
+}
+
+function appendTerminalBacklog(session: TerminalSessionRecord, data: string): void {
+	const next = Buffer.concat([session.backlog, Buffer.from(data, 'utf8')]);
+	session.backlog = next.byteLength > maxTerminalBacklogBytes
+		? next.subarray(next.byteLength - maxTerminalBacklogBytes)
+		: next;
+}
+
+function isTerminalLaunchError(result: ITerminalLaunchError | { injectedArgs: string[] } | undefined): result is ITerminalLaunchError {
+	return !!result && typeof (result as ITerminalLaunchError).message === 'string';
+}
+
+// ---------------------------------------------------------------------------
+// Workspace channel
+// ---------------------------------------------------------------------------
+
+interface WorkspaceFolderDocument {
+	uri: string;
+	path: string;
+	name: string;
+	index: number;
+}
+
+interface WorkspaceSymbolDocument {
+	name: string;
+	containerName?: string;
+	kind: number;
+	tags?: number[];
+	uri: string;
+	path: string;
+	range: DocumentRange;
+}
+
+interface WorkspaceSearchResultDocument {
+	file: string;
+	line: number;
+	column: number;
+	content: string;
+	linesBefore: string;
+	linesAfter: string;
+}
+
+interface WorkspaceFileResultDocument {
+	path: string;
+	name: string;
+	isDir: boolean;
+}
+
+interface WorkspaceProblemDocument {
+	uri: string;
+	path: string;
+	range: DocumentRange;
+	severity?: number;
+	code?: string | { value: string; target: string };
+	source?: string;
+	message: string;
+	tags?: number[];
+}
+
+interface WorkspaceChangedEnvelope {
+	type: 'foldersChanged';
+	workbenchState: 'empty' | 'folder' | 'workspace';
+	folders: WorkspaceFolderDocument[];
+	added: WorkspaceFolderDocument[];
+	removed: WorkspaceFolderDocument[];
+	changed: WorkspaceFolderDocument[];
+}
+
+export class MobileWorkspaceChannel implements IServerChannel<RemoteAgentConnectionContext> {
+	private readonly workspaceChangedEmitter = new Emitter<WorkspaceChangedEnvelope>();
+
+	constructor(
+		private readonly _logService: ILogService,
+		private readonly _searchService: ISearchService,
+		private readonly _workspaceContextService: IWorkspaceContextService,
+		private readonly _markerService: IMarkerService,
+	) {
+		this._workspaceContextService.onDidChangeWorkspaceFolders(event => {
+			this.workspaceChangedEmitter.fire(this.serializeWorkspaceChanged(event));
+		});
+		this._workspaceContextService.onDidChangeWorkbenchState(() => {
+			this.workspaceChangedEmitter.fire(this.serializeWorkspaceChanged({
+				added: [],
+				removed: [],
+				changed: [],
+			}));
+		});
+	}
+
+	call(_ctx: RemoteAgentConnectionContext, command: string, arg?: any): Promise<any> {
+		this._logService.trace(`[MobileWorkspaceChannel] ${command}`, arg);
+		switch (command) {
+			case 'folders': return Promise.resolve(this.folders());
+			case 'symbols': return this.symbols(arg);
+			case 'searchFiles': return this.searchFiles(arg);
+			case 'searchText': return this.searchText(arg);
+			case 'problems': return Promise.resolve(this.problems(arg));
+		}
+		throw new Error(`Command not found: ${command}`);
+	}
+
+	listen(_ctx: RemoteAgentConnectionContext, event: string, _arg?: any): Event<any> {
+		switch (event) {
+			case 'workspaceChanged':
+				return this.workspaceChangedEmitter.event;
+		}
+		throw new Error(`Event not found: ${event}`);
+	}
+
+	private folders(): WorkspaceFolderDocument[] {
+		return this.serializeFolders(this._workspaceContextService.getWorkspace().folders.map(folder => folder.uri));
+	}
+
+	private async symbols(arg: any): Promise<WorkspaceSymbolDocument[]> {
+		const query = typeof arg?.query === 'string' ? arg.query : '';
+		const maxResults = normalizeWorkspaceMaxResults(arg?.max, 200);
+		const symbols = await getWorkspaceSymbols(query, CancellationToken.None);
+		return symbols
+			.slice(0, maxResults)
+			.map(item => serializeWorkspaceSymbol(item.symbol));
+	}
+
+	private async searchFiles(arg: any): Promise<WorkspaceFileResultDocument[]> {
+		const query = typeof arg?.query === 'string' ? arg.query.trim() : '';
+		if (!query) {
+			return [];
+		}
+		const results = await this._searchService.fileSearch({
+			type: QueryType.File,
+			folderQueries: this.folderQueries(arg?.workDir as string | undefined),
+			filePattern: query,
+			maxResults: normalizeWorkspaceMaxResults(arg?.max, 200),
+			sortByScore: true,
+		}, CancellationToken.None);
+		return results.results.map(match => ({
+			path: match.resource.fsPath,
+			name: basename(match.resource.fsPath),
+			isDir: false,
+		}));
+	}
+
+	private async searchText(arg: any): Promise<WorkspaceSearchResultDocument[]> {
+		const query = typeof arg?.query === 'string' ? arg.query.trim() : '';
+		if (!query) {
+			return [];
+		}
+
+		const maxResults = normalizeWorkspaceMaxResults(arg?.max, DEFAULT_MAX_SEARCH_RESULTS);
+		const results: WorkspaceSearchResultDocument[] = [];
+		const seen = new Set<string>();
+		const pushMatches = (complete: ISearchComplete | IFileMatchLike) => {
+			for (const fileMatch of complete.results) {
+				for (const entry of fileMatch.results ?? []) {
+					if (!resultIsMatch(entry)) {
+						continue;
+					}
+					for (const pairing of entry.rangeLocations) {
+						const record = serializeWorkspaceSearchResult(fileMatch.resource.fsPath, entry.previewText, pairing);
+						const key = `${record.file}:${record.line}:${record.column}:${record.content}`;
+						if (seen.has(key)) {
+							continue;
+						}
+						seen.add(key);
+						results.push(record);
+						if (results.length >= maxResults) {
+							return;
+						}
+					}
+					if (results.length >= maxResults) {
+						return;
+					}
+				}
+			}
+		};
+
+		const complete = await this._searchService.textSearch({
+			type: QueryType.Text,
+			folderQueries: this.folderQueries(arg?.workDir as string | undefined),
+			contentPattern: { pattern: query },
+			maxResults,
+			previewOptions: {
+				matchLines: 1,
+				charsPerLine: 256,
+			},
+		}, CancellationToken.None, progress => {
+			if (!isFileMatch(progress) || results.length >= maxResults) {
+				return;
+			}
+			pushMatches({ results: [progress] });
+		});
+		if (results.length < maxResults) {
+			pushMatches(complete);
+		}
+		return results.slice(0, maxResults);
+	}
+
+	private problems(arg: any): WorkspaceProblemDocument[] {
+		const maxResults = normalizeWorkspaceMaxResults(arg?.max, 1000);
+		const roots = this.problemRoots(arg?.workDir as string | undefined);
+		const markers = this._markerService.read({ take: maxResults * 2 });
+		const filtered = markers
+			.filter(marker => marker.resource.scheme === 'file' && matchesWorkspaceRoots(marker.resource.fsPath, roots))
+			.sort((a, b) => compareWorkspaceProblems(a, b))
+			.slice(0, maxResults);
+		return filtered.map(marker => serializeWorkspaceProblem(marker));
+	}
+
+	private folderQueries(workDir: string | undefined) {
+		const trimmed = typeof workDir === 'string' ? workDir.trim() : '';
+		if (trimmed) {
+			return [{ folder: URI.file(trimmed) }];
+		}
+		const folders = this._workspaceContextService.getWorkspace().folders;
+		if (folders.length > 0) {
+			return folders.map(folder => ({ folder: folder.uri }));
+		}
+		return [{ folder: URI.file(process.cwd()) }];
+	}
+
+	private problemRoots(workDir: string | undefined): string[] {
+		const trimmed = typeof workDir === 'string' ? workDir.trim() : '';
+		if (trimmed) {
+			return [trimmed];
+		}
+		const folders = this._workspaceContextService.getWorkspace().folders.map(folder => folder.uri.fsPath);
+		return folders.length > 0 ? folders : [process.cwd()];
+	}
+
+	private serializeWorkspaceChanged(event: IWorkspaceFoldersChangeEvent): WorkspaceChangedEnvelope {
+		return {
+			type: 'foldersChanged',
+			workbenchState: workbenchStateLabel(this._workspaceContextService.getWorkbenchState()),
+			folders: this.serializeFolders(this._workspaceContextService.getWorkspace().folders.map(folder => folder.uri)),
+			added: this.serializeFolders(event.added.map(folder => folder.uri)),
+			removed: this.serializeFolders(event.removed.map(folder => folder.uri)),
+			changed: this.serializeFolders(event.changed.map(folder => folder.uri)),
+		};
+	}
+
+	private serializeFolders(uris: readonly URI[]): WorkspaceFolderDocument[] {
+		return uris.map((uri, index) => ({
+			uri: uri.toString(),
+			path: uri.fsPath,
+			name: basename(uri.fsPath) || uri.fsPath,
+			index,
+		}));
+	}
+}
+
+interface IFileMatchLike {
+	results: { resource: URI; results?: any[] }[];
+}
+
+function normalizeWorkspaceMaxResults(value: unknown, fallback: number): number {
+	const parsed = typeof value === 'number' ? value : Number(value);
+	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function serializeWorkspaceSymbol(symbol: IWorkspaceSymbol): WorkspaceSymbolDocument {
+	return {
+		name: symbol.name,
+		...(symbol.containerName ? { containerName: symbol.containerName } : {}),
+		kind: symbol.kind,
+		...(symbol.tags?.length ? { tags: symbol.tags } : {}),
+		uri: symbol.location.uri.toString(),
+		path: symbol.location.uri.fsPath,
+		range: serializeRange(symbol.location.range),
+	};
+}
+
+function serializeWorkspaceSearchResult(path: string, previewText: string, pairing: { source: { startLineNumber: number; startColumn: number }; preview: { startLineNumber: number; endLineNumber: number } }): WorkspaceSearchResultDocument {
+	const lines = previewText.replace(/\r\n/g, '\n').split('\n');
+	const previewIndex = Math.min(Math.max(pairing.preview.startLineNumber, 0), Math.max(lines.length - 1, 0));
+	const content = (lines[previewIndex] ?? previewText).trimEnd();
+	return {
+		file: path,
+		line: pairing.source.startLineNumber + 1,
+		column: pairing.source.startColumn + 1,
+		content,
+		linesBefore: previewIndex > 0 ? (lines[previewIndex - 1] ?? '').trimEnd() : '',
+		linesAfter: previewIndex + 1 < lines.length ? (lines[previewIndex + 1] ?? '').trimEnd() : '',
+	};
+}
+
+function serializeWorkspaceProblem(marker: IMarker): WorkspaceProblemDocument {
+	return {
+		uri: marker.resource.toString(),
+		path: marker.resource.fsPath,
+		range: serializeRange(marker),
+		...(marker.severity ? { severity: markerSeverityToDiagnosticSeverity(marker.severity) } : {}),
+		...(marker.code ? { code: serializeMarkerCode(marker.code) } : {}),
+		...(marker.source ? { source: marker.source } : {}),
+		message: marker.message,
+		...(marker.tags?.length ? { tags: marker.tags } : {}),
+	};
+}
+
+function compareWorkspaceProblems(a: IMarker, b: IMarker): number {
+	if (a.severity !== b.severity) {
+		return (b.severity ?? MarkerSeverity.Info) - (a.severity ?? MarkerSeverity.Info);
+	}
+	if (a.resource.fsPath !== b.resource.fsPath) {
+		return a.resource.fsPath.localeCompare(b.resource.fsPath);
+	}
+	if (a.startLineNumber !== b.startLineNumber) {
+		return a.startLineNumber - b.startLineNumber;
+	}
+	return a.startColumn - b.startColumn;
+}
+
+function matchesWorkspaceRoots(candidate: string, roots: readonly string[]): boolean {
+	return roots.some(root => candidate === root || candidate.startsWith(`${root}/`) || candidate.startsWith(`${root}\\`));
+}
+
+function workbenchStateLabel(state: WorkbenchState): 'empty' | 'folder' | 'workspace' {
+	switch (state) {
+		case WorkbenchState.FOLDER:
+			return 'folder';
+		case WorkbenchState.WORKSPACE:
+			return 'workspace';
+		default:
+			return 'empty';
+	}
+}
+
+function markerSeverityToDiagnosticSeverity(severity: MarkerSeverity): number {
+	switch (severity) {
+		case MarkerSeverity.Error:
+			return 1;
+		case MarkerSeverity.Warning:
+			return 2;
+		case MarkerSeverity.Info:
+			return 3;
+		default:
+			return 4;
 	}
 }
 

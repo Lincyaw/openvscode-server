@@ -51,6 +51,7 @@ import { IPtyService, TerminalSettingId } from '../../platform/terminal/common/t
 import { PtyHostService } from '../../platform/terminal/node/ptyHostService.js';
 import { IUriIdentityService } from '../../platform/uriIdentity/common/uriIdentity.js';
 import { UriIdentityService } from '../../platform/uriIdentity/common/uriIdentityService.js';
+import { IWorkspaceContextService } from '../../platform/workspace/common/workspace.js';
 import { RemoteAgentEnvironmentChannel } from './remoteAgentEnvironmentImpl.js';
 import { RemoteAgentFileSystemProviderChannel } from './remoteFileSystemProviderServer.js';
 import { ServerTelemetryChannel } from '../../platform/telemetry/common/remoteTelemetryChannel.js';
@@ -100,7 +101,8 @@ import { McpManagementChannel } from '../../platform/mcp/common/mcpManagementIpc
 import { AllowedMcpServersService } from '../../platform/mcp/common/allowedMcpServersService.js';
 import { IMcpGalleryManifestService } from '../../platform/mcp/common/mcpGalleryManifest.js';
 import { McpGalleryManifestIPCService } from '../../platform/mcp/common/mcpGalleryManifestServiceIpc.js';
-import { MobileGitChannel, MobileEditorChannel, MobileBridgeMetadataWriter } from './mobileRuntimeBridgeChannel.js';
+import { ISearchService } from '../../workbench/services/search/common/search.js';
+import { MobileGitChannel, MobileEditorChannel, MobileBridgeMetadataWriter, MobileTerminalChannel, MobileWorkspaceChannel } from './mobileRuntimeBridgeChannel.js';
 
 const eventPrefix = 'monacoworkbench';
 
@@ -272,6 +274,18 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 		const bridgeMetadataWriter = new MobileBridgeMetadataWriter();
 		bridgeMetadataWriter.write();
 		socketServer.registerChannel('openvsmobile/git', new MobileGitChannel(logService));
+		socketServer.registerChannel('openvsmobile/terminal', new MobileTerminalChannel(
+			logService,
+			ptyHostService,
+			configurationService,
+			productService,
+		));
+		socketServer.registerChannel('openvsmobile/workspace', new MobileWorkspaceChannel(
+			logService,
+			accessor.get(ISearchService),
+			accessor.get(IWorkspaceContextService),
+			accessor.get(IMarkerService),
+		));
 		socketServer.registerChannel('openvsmobile/editor', new MobileEditorChannel(
 			logService,
 			accessor.get(ITextFileService),
