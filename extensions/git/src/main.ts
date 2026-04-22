@@ -20,6 +20,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import { GitTimelineProvider } from './timelineProvider';
 import { registerAPICommands } from './api/api1';
+import { registerBridgeCommands } from './bridgeApi';
 import { TerminalEnvironmentManager, TerminalShellExecutionManager } from './terminal';
 import { createIPCServer, IPCServer } from './ipc/ipcServer';
 import { GitEditor, GitEditorDocumentLinkProvider } from './gitEditor';
@@ -260,6 +261,9 @@ export async function activate(context: ExtensionContext): Promise<GitExtension>
 
 	const result = await _activate(context);
 	context.subscriptions.push(registerAPICommands(result));
+	if (result.model) {
+		context.subscriptions.push(registerBridgeCommands(result.model));
+	}
 	return result;
 }
 

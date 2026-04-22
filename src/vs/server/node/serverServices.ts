@@ -32,9 +32,12 @@ import { SyncDescriptor } from '../../platform/instantiation/common/descriptors.
 import { IInstantiationService } from '../../platform/instantiation/common/instantiation.js';
 import { InstantiationService } from '../../platform/instantiation/common/instantiationService.js';
 import { ServiceCollection } from '../../platform/instantiation/common/serviceCollection.js';
+import { IModelService } from '../../editor/common/services/model.js';
+import { ICommandService } from '../../platform/commands/common/commands.js';
 import { ILanguagePackService } from '../../platform/languagePacks/common/languagePacks.js';
 import { NativeLanguagePackService } from '../../platform/languagePacks/node/languagePacks.js';
 import { AbstractLogger, DEFAULT_LOG_LEVEL, getLogLevel, ILoggerService, ILogService, log, LogLevel, LogLevelToString } from '../../platform/log/common/log.js';
+import { IMarkerService } from '../../platform/markers/common/markers.js';
 import product from '../../platform/product/common/product.js';
 import { IProductService } from '../../platform/product/common/productService.js';
 import { RemoteAgentConnectionContext } from '../../platform/remote/common/remoteAgentEnvironment.js';
@@ -96,6 +99,9 @@ import { McpManagementChannel } from '../../platform/mcp/common/mcpManagementIpc
 import { AllowedMcpServersService } from '../../platform/mcp/common/allowedMcpServersService.js';
 import { IMcpGalleryManifestService } from '../../platform/mcp/common/mcpGalleryManifest.js';
 import { McpGalleryManifestIPCService } from '../../platform/mcp/common/mcpGalleryManifestServiceIpc.js';
+import { IWorkingCopyService } from '../../workbench/services/workingCopy/common/workingCopyService.js';
+import { MobileGitChannel, MobileEditorChannel, MobileDocumentsChannel, MobileBridgeMetadataWriter, MobileRuntimeDocumentService } from './mobileRuntimeBridgeChannel.js';
+import { MobileTerminalChannel } from './mobileRuntimeTerminalChannel.js';
 
 const eventPrefix = 'monacoworkbench';
 
@@ -262,6 +268,29 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 		socketServer.registerChannel('extensions', channel);
 
 		socketServer.registerChannel('mcpManagement', new McpManagementChannel(mcpManagementService, (ctx: RemoteAgentConnectionContext) => getUriTransformer(ctx.remoteAuthority)));
+
+		// Mobile Runtime Bridge
+		const bridgeMetadataWriter = new MobileBridgeMetadataWriter();
+		bridgeMetadataWriter.write();
+		const mobileRuntimeDocuments = new MobileRuntimeDocumentService(
+			accessor.get(IModelService),
+			accessor.get(IWorkingCopyService)
+		);
+		socketServer.registerChannel('openvsmobile/documents', new MobileDocumentsChannel(logService, mobileRuntimeDocuments));
+		socketServer.registerChannel('openvsmobile/git', new MobileGitChannel(
+			logService,
+			accessor.get(ICommandService)
+		));
+		socketServer.registerChannel('openvsmobile/terminal', new MobileTerminalChannel(
+			logService,
+			accessor.get(IPtyService)
+		));
+		socketServer.registerChannel('openvsmobile/editor', new MobileEditorChannel(
+			logService,
+			mobileRuntimeDocuments,
+			accessor.get(ICommandService),
+			accessor.get(IMarkerService)
+		));
 
 		// clean up extensions folder
 		remoteExtensionsScanner.whenExtensionsReady().then(() => extensionManagementService.cleanUp());
