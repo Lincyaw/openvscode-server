@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { spawn } from 'child_process';
+import * as http from 'http';
 import { promises as fs, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -84,13 +84,12 @@ export class MobileBridgeMetadataWriter {
 					documentSymbols: { enabled: true },
 				},
 				git: {
-					enabled: false,
-					push: false,
-					pull: false,
-					fetch: false,
-					conflicts: false,
-					aheadBehind: false,
-					reason: 'Source Control runtime bridge is not implemented yet.',
+					enabled: true,
+					push: true,
+					pull: true,
+					fetch: true,
+					conflicts: true,
+					aheadBehind: true,
 				},
 				terminal: {
 					enabled: false,
@@ -152,6 +151,7 @@ interface GitChange {
 	status?: string;
 	indexStatus?: string;
 	workingTreeStatus?: string;
+	mergeStatus?: GitMergeStatus;
 }
 
 interface GitDiffDocument {
@@ -160,140 +160,182 @@ interface GitDiffDocument {
 	staged: boolean;
 }
 
-function runGit(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
-	return new Promise((resolve, reject) => {
-		const child = spawn('git', args, { cwd });
-		let stdout = '';
-		let stderr = '';
-		child.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
-		child.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
-		child.on('close', (code) => {
-			resolve({ stdout, stderr, code: code ?? 0 });
-		});
-		child.on('error', (err) => reject(err));
-	});
+interface GitMergeStatus {
+	kind?: string;
+	current?: string;
+	incoming?: string;
 }
 
-async function getRepositoryState(path: string): Promise<GitRepositoryDocument> {
-	// branch and upstream
-	const branchResult = await runGit(path, ['branch', '-vv']);
-	let branch = '';
-	let upstream = '';
-	for (const line of branchResult.stdout.split('\n')) {
-		const m = line.match(/^\*\s+(\S+)\s+(?:\[([^\]]+)\])?/);
-		if (m) {
-			branch = m[1];
-			if (m[2]) {
-				const upParts = m[2].split(/[:\s]/);
-				upstream = upParts[0];
+interface GitRuntimeBridgeInfo {
+	port: number;
+	token: string;
+}
+
+const gitRuntimeInfoPath = process.env.OPENVSCODE_MOBILE_GIT_RUNTIME_INFO_PATH
+	|| join(homedir(), '.config', 'openvscode-mobile', 'git-runtime.json');
+
+function wait(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function asError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error));
+}
+
+class GitRuntimeBridgeClient {
+	constructor(private readonly _logService: ILogService) { }
+
+	private async readInfo(retries = 20): Promise<GitRuntimeBridgeInfo> {
+		let lastError: Error | undefined;
+		for (let attempt = 0; attempt < retries; attempt++) {
+			try {
+				const raw = await fs.readFile(gitRuntimeInfoPath, 'utf8');
+				const parsed = JSON.parse(raw) as Partial<GitRuntimeBridgeInfo>;
+				if (typeof parsed.port === 'number' && typeof parsed.token === 'string' && parsed.token.length > 0) {
+					return { port: parsed.port, token: parsed.token };
+				}
+				lastError = new Error('Git runtime bridge metadata is malformed.');
+			} catch (error) {
+				lastError = asError(error);
 			}
-			break;
+			await wait(250);
 		}
+		throw lastError ?? new Error('Git runtime bridge metadata is unavailable.');
 	}
 
-	// ahead/behind
-	let ahead = 0;
-	let behind = 0;
-	if (upstream) {
-		try {
-			const revResult = await runGit(path, ['rev-list', '--left-right', '--count', `HEAD...@{upstream}`]);
-			const parts = revResult.stdout.trim().split(/\s+/);
-			if (parts.length === 2) {
-				ahead = parseInt(parts[0], 10) || 0;
-				behind = parseInt(parts[1], 10) || 0;
-			}
-		} catch (_) {
-			// ignore
-		}
-	}
-
-	// remotes
-	const remoteResult = await runGit(path, ['remote', '-v']);
-	const remotes: GitRemote[] = [];
-	const seenRemotes = new Set<string>();
-	for (const line of remoteResult.stdout.split('\n')) {
-		const m = line.match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)/);
-		if (!m) { continue; }
-		const name = m[1];
-		const url = m[2];
-		const kind = m[3];
-		if (seenRemotes.has(name)) {
-			const r = remotes.find(r => r.name === name);
-			if (r) {
-				if (kind === 'fetch') { r.fetchUrl = url; }
-				if (kind === 'push') { r.pushUrl = url; }
-			}
-		} else {
-			seenRemotes.add(name);
-			remotes.push({
-				name,
-				fetchUrl: kind === 'fetch' ? url : undefined,
-				pushUrl: kind === 'push' ? url : undefined,
+	private async requestJson<T>(pathname: string, payload?: Record<string, unknown>): Promise<T> {
+		const info = await this.readInfo();
+		return new Promise<T>((resolve, reject) => {
+			const body = payload ? JSON.stringify(payload) : undefined;
+			const request = http.request({
+				host: '127.0.0.1',
+				port: info.port,
+				path: pathname,
+				method: body ? 'POST' : 'GET',
+				headers: {
+					'authorization': `Bearer ${info.token}`,
+					'content-type': 'application/json',
+					...(body ? { 'content-length': Buffer.byteLength(body) } : {}),
+				},
+			}, response => {
+				let responseBody = '';
+				response.setEncoding('utf8');
+				response.on('data', chunk => responseBody += chunk);
+				response.on('end', () => {
+					if ((response.statusCode ?? 500) >= 400) {
+						reject(new Error(responseBody || `Git runtime bridge request failed with status ${response.statusCode ?? 500}`));
+						return;
+					}
+					try {
+						resolve(JSON.parse(responseBody) as T);
+					} catch (error) {
+						reject(asError(error));
+					}
+				});
 			});
-		}
+			request.on('error', reject);
+			if (body) {
+				request.write(body);
+			}
+			request.end();
+		});
 	}
 
-	// status
-	const statusResult = await runGit(path, ['status', '--porcelain', '-uall']);
-	const staged: GitChange[] = [];
-	const unstaged: GitChange[] = [];
-	const untracked: GitChange[] = [];
-	const conflicts: GitChange[] = [];
-
-	for (const line of statusResult.stdout.split('\n')) {
-		if (line.length < 2) { continue; }
-		const index = line[0];
-		const workTree = line[1];
-		const rest = line.slice(3).trim();
-		const filePath = rest.split(' -> ').pop() ?? rest;
-
-		if (index === 'U' || workTree === 'U' || (index === 'D' && workTree === 'D') || (index === 'A' && workTree === 'A')) {
-			conflicts.push({ path: filePath, status: 'conflict' });
-		} else if (index === '?' && workTree === '?') {
-			untracked.push({ path: filePath, status: 'untracked' });
-		} else if (index !== ' ' && index !== '?') {
-			staged.push({ path: filePath, indexStatus: index, status: mapGitStatus(index) });
-		}
-
-		if (workTree !== ' ' && workTree !== '?') {
-			unstaged.push({ path: filePath, workingTreeStatus: workTree, status: mapGitStatus(workTree) });
-		}
+	repository(path: string): Promise<GitRepositoryDocument> {
+		return this.requestJson<GitRepositoryDocument>('/repository', { path });
 	}
 
-	return {
-		path,
-		branch,
-		upstream,
-		ahead,
-		behind,
-		remotes,
-		staged,
-		unstaged,
-		untracked,
-		conflicts,
-		mergeChanges: [],
-	};
-}
+	command<T>(command: string, payload: Record<string, unknown>): Promise<T> {
+		return this.requestJson<T>(`/${command}`, payload);
+	}
 
-function mapGitStatus(code: string): string {
-	switch (code) {
-		case 'M': return 'modified';
-		case 'A': return 'added';
-		case 'D': return 'deleted';
-		case 'R': return 'renamed';
-		case 'C': return 'copied';
-		case 'U': return 'updated';
-		case '?': return 'untracked';
-		default: return 'unknown';
+	watchRepository(path: string, onEvent: (repository: GitRepositoryDocument) => void, onError: (error: Error) => void): () => void {
+		let disposed = false;
+		let request: http.ClientRequest | undefined;
+		let reconnectHandle: NodeJS.Timeout | undefined;
+
+		const scheduleReconnect = () => {
+			if (disposed || reconnectHandle) {
+				return;
+			}
+			reconnectHandle = setTimeout(() => {
+				reconnectHandle = undefined;
+				void connect();
+			}, 1000);
+		};
+
+		const connect = async () => {
+			try {
+				const info = await this.readInfo(40);
+				if (disposed) {
+					return;
+				}
+				request = http.request({
+					host: '127.0.0.1',
+					port: info.port,
+					path: `/events?path=${encodeURIComponent(path)}`,
+					method: 'GET',
+					headers: {
+						'authorization': `Bearer ${info.token}`,
+						'accept': 'application/x-ndjson',
+					},
+				}, response => {
+					if ((response.statusCode ?? 500) >= 400) {
+						onError(new Error(`Git runtime event stream failed with status ${response.statusCode ?? 500}`));
+						scheduleReconnect();
+						return;
+					}
+					let buffer = '';
+					response.setEncoding('utf8');
+					response.on('data', chunk => {
+						buffer += chunk;
+						while (true) {
+							const newlineIndex = buffer.indexOf('\n');
+							if (newlineIndex < 0) {
+								break;
+							}
+							const line = buffer.slice(0, newlineIndex).trim();
+							buffer = buffer.slice(newlineIndex + 1);
+							if (!line) {
+								continue;
+							}
+							try {
+								onEvent(JSON.parse(line) as GitRepositoryDocument);
+							} catch (error) {
+								onError(asError(error));
+							}
+						}
+					});
+					response.on('end', scheduleReconnect);
+				});
+				request.on('error', error => {
+					onError(asError(error));
+					scheduleReconnect();
+				});
+				request.end();
+			} catch (error) {
+				onError(asError(error));
+				scheduleReconnect();
+			}
+		};
+
+		void connect();
+		return () => {
+			disposed = true;
+			if (reconnectHandle) {
+				clearTimeout(reconnectHandle);
+			}
+			request?.destroy();
+		};
 	}
 }
 
 export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionContext> {
-	private readonly _onRepositoryChanged = new Emitter<{ path: string; repository: GitRepositoryDocument }>();
-	readonly onRepositoryChanged = this._onRepositoryChanged.event;
-	private readonly watchers = new Map<string, NodeJS.Timeout>();
+	private readonly runtimeClient: GitRuntimeBridgeClient;
 
-	constructor(private readonly _logService: ILogService) { }
+	constructor(private readonly _logService: ILogService) {
+		this.runtimeClient = new GitRuntimeBridgeClient(_logService);
+	}
 
 	call(_ctx: RemoteAgentConnectionContext, command: string, arg?: any): Promise<any> {
 		this._logService.trace(`[MobileGitChannel] ${command}`, arg);
@@ -325,23 +367,21 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 	private async getRepository(arg: any): Promise<GitRepositoryDocument> {
 		const path = arg?.path as string;
 		if (!path) { throw new Error('path is required'); }
-		return getRepositoryState(path);
+		return this.runtimeClient.repository(path);
 	}
 
 	private async stage(arg: any): Promise<GitRepositoryDocument> {
 		const path = arg?.path as string;
 		const files = (arg?.files as string[]) ?? [];
 		if (!path) { throw new Error('path is required'); }
-		await runGit(path, ['add', ...files]);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('stage', { path, files });
 	}
 
 	private async unstage(arg: any): Promise<GitRepositoryDocument> {
 		const path = arg?.path as string;
 		const files = (arg?.files as string[]) ?? [];
 		if (!path) { throw new Error('path is required'); }
-		await runGit(path, ['reset', 'HEAD', ...files]);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('unstage', { path, files });
 	}
 
 	private async commit(arg: any): Promise<GitRepositoryDocument> {
@@ -349,8 +389,7 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 		const message = arg?.message as string;
 		if (!path) { throw new Error('path is required'); }
 		if (!message) { throw new Error('message is required'); }
-		await runGit(path, ['commit', '-m', message]);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('commit', { path, message });
 	}
 
 	private async checkout(arg: any): Promise<GitRepositoryDocument> {
@@ -359,18 +398,14 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 		const create = arg?.create as boolean;
 		if (!path) { throw new Error('path is required'); }
 		if (!ref) { throw new Error('ref is required'); }
-		const args = create ? ['checkout', '-b', ref] : ['checkout', ref];
-		await runGit(path, args);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('checkout', { path, ref, create: !!create });
 	}
 
 	private async fetch(arg: any): Promise<GitRepositoryDocument> {
 		const path = arg?.path as string;
 		const remote = arg?.remote as string;
 		if (!path) { throw new Error('path is required'); }
-		const args = remote ? ['fetch', remote] : ['fetch'];
-		await runGit(path, args);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('fetch', { path, remote });
 	}
 
 	private async pull(arg: any): Promise<GitRepositoryDocument> {
@@ -378,11 +413,7 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 		const remote = arg?.remote as string;
 		const branch = arg?.branch as string;
 		if (!path) { throw new Error('path is required'); }
-		const args = ['pull'];
-		if (remote) { args.push(remote); }
-		if (branch) { args.push(branch); }
-		await runGit(path, args);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('pull', { path, remote, branch });
 	}
 
 	private async push(arg: any): Promise<GitRepositoryDocument> {
@@ -391,20 +422,14 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 		const branch = arg?.branch as string;
 		const setUpstream = arg?.setUpstream as boolean;
 		if (!path) { throw new Error('path is required'); }
-		const args = ['push'];
-		if (setUpstream) { args.push('--set-upstream'); }
-		if (remote) { args.push(remote); }
-		if (branch) { args.push(branch); }
-		await runGit(path, args);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('push', { path, remote, branch, setUpstream: !!setUpstream });
 	}
 
 	private async discard(arg: any): Promise<GitRepositoryDocument> {
 		const path = arg?.path as string;
 		const files = (arg?.files as string[]) ?? [];
 		if (!path) { throw new Error('path is required'); }
-		await runGit(path, ['checkout', '--', ...files]);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('discard', { path, files });
 	}
 
 	private async diff(arg: any): Promise<GitDiffDocument> {
@@ -413,9 +438,7 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 		const staged = arg?.staged as boolean;
 		if (!path) { throw new Error('path is required'); }
 		if (!file) { throw new Error('file is required'); }
-		const args = staged ? ['diff', '--staged', '--', file] : ['diff', '--', file];
-		const result = await runGit(path, args);
-		return { path: file, diff: result.stdout, staged: !!staged };
+		return this.runtimeClient.command<GitDiffDocument>('diff', { path, file, staged: !!staged });
 	}
 
 	private async stash(arg: any): Promise<GitRepositoryDocument> {
@@ -423,11 +446,7 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 		const message = arg?.message as string;
 		const includeUntracked = arg?.includeUntracked as boolean;
 		if (!path) { throw new Error('path is required'); }
-		const args = ['stash', 'push'];
-		if (message) { args.push('-m', message); }
-		if (includeUntracked) { args.push('-u'); }
-		await runGit(path, args);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('stash', { path, message, includeUntracked: !!includeUntracked });
 	}
 
 	private async stashApply(arg: any): Promise<GitRepositoryDocument> {
@@ -435,27 +454,27 @@ export class MobileGitChannel implements IServerChannel<RemoteAgentConnectionCon
 		const stashRef = arg?.stash as string;
 		const pop = arg?.pop as boolean;
 		if (!path) { throw new Error('path is required'); }
-		const args = pop ? ['stash', 'pop'] : ['stash', 'apply'];
-		if (stashRef) { args.push(stashRef); }
-		await runGit(path, args);
-		return getRepositoryState(path);
+		return this.runtimeClient.command<GitRepositoryDocument>('stash/apply', { path, stash: stashRef, pop: !!pop });
 	}
 
 	private subscribeRepositoryChanged(path: string | undefined): Event<any> {
 		if (!path) { return Event.None; }
-
-		const emitter = new Emitter<GitRepositoryDocument>();
-		const interval: ReturnType<typeof setInterval> = setInterval(async () => {
-			try {
-				const repo = await getRepositoryState(path);
-				emitter.fire(repo);
-			} catch (_) {
-				// ignore polling errors
+		return (listener, thisArgs, disposables) => {
+			const stop = this.runtimeClient.watchRepository(
+				path,
+				repository => listener.call(thisArgs, repository),
+				error => this._logService.warn('[MobileGitChannel] repositoryChanged stream error', error),
+			);
+			const disposable = {
+				dispose: () => stop(),
+			};
+			if (Array.isArray(disposables)) {
+				disposables.push(disposable);
+			} else {
+				disposables?.add(disposable);
 			}
-		}, 2000);
-
-		this.watchers.set(path, interval as any);
-		return emitter.event;
+			return disposable;
+		};
 	}
 }
 

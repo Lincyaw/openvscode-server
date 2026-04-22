@@ -1,0 +1,20 @@
+{
+  "name": "openvsmobile-bridge",
+  "displayName": "OpenVS Mobile Bridge",
+  "description": "Expose VS Code runtime Git state to the mobile bridge.",
+  "version": "0.0.1",
+  "publisher": "openvsmobile",
+  "engines": {
+    "vscode": "*"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./main.js"
+}
