@@ -3,6 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+/* eslint-disable local/code-import-patterns */
+
 import { hostname, release } from 'os';
 import { Emitter, Event } from '../../base/common/event.js';
 import { DisposableStore, toDisposable } from '../../base/common/lifecycle.js';
@@ -102,7 +104,8 @@ import { AllowedMcpServersService } from '../../platform/mcp/common/allowedMcpSe
 import { IMcpGalleryManifestService } from '../../platform/mcp/common/mcpGalleryManifest.js';
 import { McpGalleryManifestIPCService } from '../../platform/mcp/common/mcpGalleryManifestServiceIpc.js';
 import { ISearchService } from '../../workbench/services/search/common/search.js';
-import { MobileGitChannel, MobileEditorChannel, MobileBridgeMetadataWriter, MobileTerminalChannel, MobileWorkspaceChannel } from './mobileRuntimeBridgeChannel.js';
+import { MobileGitChannel, MobileEditorChannel, MobileBridgeMetadataWriter, MobileWorkspaceChannel } from 'vs/server/node/mobileRuntimeBridgeChannel.js';
+import { MobileTerminalChannel } from 'vs/server/node/mobileRuntimeTerminalChannel.js';
 
 const eventPrefix = 'monacoworkbench';
 
