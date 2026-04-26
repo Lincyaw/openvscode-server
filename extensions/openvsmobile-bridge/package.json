@@ -1,0 +1,25 @@
+{
+	"name": "openvsmobile-bridge",
+	"displayName": "OpenVSCode Mobile Runtime Bridge",
+	"description": "Exposes a local HTTP bridge that lets the openvsmobile Go server forward requests into the running VS Code extension host (git, diagnostics, workspace queries).",
+	"publisher": "openvsmobile",
+	"version": "0.1.0",
+	"engines": {
+		"vscode": "^1.86.0"
+	},
+	"main": "./extension.js",
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"extensionKind": [
+		"workspace"
+	],
+	"contributes": {},
+	"capabilities": {
+		"untrustedWorkspaces": {
+			"supported": true
+		},
+		"virtualWorkspaces": false
+	},
+	"private": true
+}
