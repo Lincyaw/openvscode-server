@@ -9,7 +9,7 @@
 	},
 	"main": "./extension.js",
 	"activationEvents": [
-		"onStartupFinished"
+		"*"
 	],
 	"extensionKind": [
 		"workspace"

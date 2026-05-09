@@ -7,7 +7,7 @@ import * as path from 'path';
 import { commands, Disposable, Uri } from 'vscode';
 import { Model } from './model';
 import { Repository as BaseRepository, Resource, ResourceGroupType } from './repository';
-import { Branch, Change, Remote, Status } from './api/git';
+import { Branch, Remote, Status } from './api/git';
 
 interface GitBridgeHead {
 	name?: string;
@@ -141,15 +141,14 @@ function mergeStatus(status: Status): GitBridgeChange['mergeStatus'] | undefined
 	}
 }
 
-function serializeChange(repository: BaseRepository, change: Change): GitBridgeChange {
-	const resource = change as Resource;
+function serializeChange(repository: BaseRepository, change: Resource): GitBridgeChange {
 	return {
-		path: relativePath(repository, change.uri.fsPath),
-		originalPath: resource.renameResourceUri ? relativePath(repository, resource.originalUri.fsPath) : undefined,
-		status: statusLabel(change.status),
-		indexStatus: resource.resourceGroupType === ResourceGroupType.Index ? statusLabel(change.status) : undefined,
-		workingTreeStatus: resource.resourceGroupType === ResourceGroupType.WorkingTree || resource.resourceGroupType === ResourceGroupType.Untracked ? statusLabel(change.status) : undefined,
-		mergeStatus: mergeStatus(change.status),
+		path: relativePath(repository, change.resourceUri.fsPath),
+		originalPath: change.renameResourceUri ? relativePath(repository, change.original.fsPath) : undefined,
+		status: statusLabel(change.type),
+		indexStatus: change.resourceGroupType === ResourceGroupType.Index ? statusLabel(change.type) : undefined,
+		workingTreeStatus: change.resourceGroupType === ResourceGroupType.WorkingTree || change.resourceGroupType === ResourceGroupType.Untracked ? statusLabel(change.type) : undefined,
+		mergeStatus: mergeStatus(change.type),
 	};
 }
 
